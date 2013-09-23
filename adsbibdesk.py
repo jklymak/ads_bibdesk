@@ -175,7 +175,7 @@ updated if it has a new bibcode."""
         process_articles(args, prefs)
 
 
-def process_articles(args, prefs, delay=15):
+def process_articles(args, prefs, pdfs, delay=15):
     """Workflow for processing article tokens"""
     if args:
         articleTokens = list(args)
@@ -188,15 +188,18 @@ def process_articles(args, prefs, delay=15):
     # AppKit hook for BibDesk
     bibdesk = BibDesk()
 
-    for articleToken in articleTokens:
-        process_token(articleToken, prefs, bibdesk)
+    for (pdf,articleToken) in zip(pdfs,articleTokens):
+        # fix for dumb journals that put a period at end of doi
+        if articleToken[-1]=='.':
+            articleToken=articleToken[:-1]
+        process_token(articleToken, prefs, bibdesk,pdf)
         if len(articleTokens) > 1 and articleToken != articleTokens[-1]:
             time.sleep(delay)
 
     bibdesk.app.dealloc()
 
 
-def process_token(articleToken, prefs, bibdesk):
+def process_token(articleToken, prefs, bibdesk,pdf):
     """Process a single article token from the user.
     :param articleToken: Any user-supplied `str` token.
     :param prefs: A `Preferences` instance.
@@ -242,7 +245,9 @@ def process_token(articleToken, prefs, bibdesk):
         return False
 
     # get PDF first
-    pdf = ads.getPDF()
+    # pdf = ads.getPDF()
+
+    print 'Hi!  %s' % pdf
 
     if prefs['options'].get('only_pdf'):
         if not pdf.endswith('.pdf'):
@@ -276,26 +281,14 @@ def process_token(articleToken, prefs, bibdesk):
     found = difflib.get_close_matches(ads.title, bibdesk.titles,
                                       n=1, cutoff=.7)
     keptPDFs = []
-    keptFields = {}
     # first author is the same
     if found and difflib.SequenceMatcher(None,
                                          bibdesk.authors(bibdesk.pid(found[0]))[0],
                                          ads.author[0]).ratio() > .6:
-        # further comparison on abstract
-        abstract = bibdesk('abstract', bibdesk.pid(found[0])).stringValue()
-        if not abstract or difflib.SequenceMatcher(None, abstract, ads.abstract).ratio() > .6:
-            pid = bibdesk.pid(found[0])
-            # keep all fields for later comparison (especially rating + read bool)
-            keptFields = dict((k,v) for k,v in
-                              zip(bibdesk('return name of fields', pid, True),
-                                  bibdesk('return value of fields', pid, True))
-                              if k != 'Adscomment') # Adscomment may be arXiv only
-            # plus BibDesk annotation
-            keptFields['BibDeskAnnotation'] = bibdesk('return its note', pid).stringValue()
-            keptPDFs += bibdesk.safe_delete(pid)
-            notify('Duplicate publication removed',
-                   articleToken, ads.title)
-            bibdesk.refresh()
+        keptPDFs += bibdesk.safe_delete(bibdesk.pid(found[0]))
+        notify('Duplicate publication removed',
+               articleToken, ads.title)
+        bibdesk.refresh()
 
     # add new entry
     pub = bibdesk('import from "%s"' % ads.bibtex.__str__().replace('\\', r'\\').replace('"', r'\"'))
@@ -313,7 +306,9 @@ def process_token(articleToken, prefs, bibdesk):
                 % ads.abstract.replace('\\', r'\\').replace('"', r'\"'), pub)
 
     if pdf.endswith('.pdf'):
+        print pdf
         # register PDF into BibDesk
+        print "Yay %s " % pdf
         bibdesk('add POSIX file "%s" to beginning of linked files' % pdf, pub)
         # automatic file name
         bibdesk('auto file', pub)
@@ -333,12 +328,6 @@ def process_token(articleToken, prefs, bibdesk):
     for keptPDF in keptPDFs:
         bibdesk('add POSIX file "%s" to end of linked files' % keptPDF, pub)
 
-    # re-insert custom fields
-    bibdesk('set its note to "%s"' % keptFields.pop('BibDeskAnnotation', ''), pub)
-    newFields = bibdesk('return name of fields', pub, True)
-    for k, v in keptFields.iteritems():
-        if k not in newFields:
-            bibdesk('set value of field "%s" to "%s"' % (k, v), pub)
     notify('New publication added',
            bibdesk('cite key', pub).stringValue(),
            ads.title)
@@ -381,7 +370,9 @@ def ingest_pdfs(options, args, prefs):
     # let process_articles inject everything
     if found:
         logging.info('Adding %i articles to BibDesk...' % len(found))
-        process_articles(found, prefs)
+        print found
+        print pdfPaths
+        process_articles(found, prefs,pdfPaths)
 
 
 def update_arxiv(options, prefs):
@@ -480,7 +471,7 @@ def update_arxiv(options, prefs):
                              % len(changed)) in ('Y', 'y'):
         logging.info('(to prevent ADS flooding, we will wait for a while between '
                      'each update, so go grab a coffee)')
-        process_articles(changed, prefs)
+        process_articles(changed, prefs,[])
 
     elif not changed:
         logging.info('Nothing to update!')
@@ -539,11 +530,11 @@ def hasAnnotations(f):
 
 def getRedirect(url):
     """Utility function to intercept final URL of HTTP redirection"""
-    try:
-        out = urllib2.urlopen(url)
-    except urllib2.URLError, out:
-        pass
-    return out.geturl()
+    import httplib
+    url = urlparse.urlsplit(url)
+    conn = httplib.HTTPConnection(url.netloc)
+    conn.request('GET', url.path + '?' + url.query)
+    return conn.getresponse().getheader('Location')
 
 
 class PDFDOIGrabber(object):
@@ -560,7 +551,7 @@ class PDFDOIGrabber(object):
             os.remove(jsonPath)
         sp.call('pdf2json -q "%s" "%s"' % (pdfPath, jsonPath), shell=True)
         data = open(jsonPath, 'r').read()
-        doiMatches = self.pattern.findall(data)
+        doiMatches = [self.pattern.findall(data)[0]]
         if os.path.exists(jsonPath):
             os.remove(jsonPath)
 
@@ -643,7 +634,7 @@ class ADSConnector(object):
                                                self.prefs['ads_mirror'],
                                                'cgi-bin/bib_query',
                                                'arXiv:%s' % self.arxivID, ''))
-            return True
+            return False
         else:
             self.arxivID = None
             return False
@@ -1078,38 +1069,27 @@ class ADSHTMLParser(HTMLParser):
         # refereed
         if 'article' in self.links:
             url = self.links['article']
-            # Resolve URL
-            resolved_url = getRedirect(url)
-            logging.debug("Resolve article URL: %s" % resolved_url)
-            if "filetype=.pdf" in resolved_url:
-                # URL will directly resolve into a PDF
-                pdf_url = resolved_url
-            elif "MNRAS" in resolved_url:
-                # Special case for MNRAS URLs to deal with iframe
+            if "MNRAS" in url:  # Special case for MNRAS URLs to deal with iframe
                 parser = MNRASParser(self.prefs)
                 try:
                     parser.parse(url)
                 except MNRASException:
-                    # this probably means we have a PDF directly from ADS
-                    # afterall just continue.
-                    # NOTE this case may be deprecated by resolving the URL
-                    pdf_url = resolved_url
+                    # this probably means we have a PDF directly from ADS, just continue
+                    pass
                 if parser.pdfURL is not None:
-                    pdf_url = parser.pdfURL
-                else:
-                    pdf_url = resolved_url
-            else:
-                pdf_url = resolved_url
+                    url = parser.pdfURL
 
             # try locally
             fd, pdf = tempfile.mkstemp(suffix='.pdf')
             # test for HTTP auth need
             try:
-                os.fdopen(fd, 'wb').write(urllib2.urlopen(pdf_url).read())
-            except urllib2.URLError, err: # HTTPError derives from URLError
-                logging.debug('%s failed: %s' % (pdf_url, err))
+                os.fdopen(fd, 'wb').write(urllib2.urlopen(url).read())
+            except urllib2.HTTPError:
                 # dummy file
                 open(pdf, 'w').write('dummy')
+            except urllib2.URLError:
+                logging.debug('%s timed out' % url)
+                pass
 
             if 'PDF document' in filetype(pdf):
                 return pdf
@@ -1120,7 +1100,7 @@ class ADSHTMLParser(HTMLParser):
                 fd, pdf = tempfile.mkstemp(suffix='.pdf')
                 cmd = 'ssh %s@%s \"touch adsbibdesk.pdf; wget -O adsbibdesk.pdf \\"%s\\"\"' % (self.prefs['ssh_user'],
                                                                                                self.prefs['ssh_server'],
-                                                                                               pdf_url)
+                                                                                               url)
                 cmd2 = 'scp -q %s@%s:adsbibdesk.pdf %s' % (self.prefs['ssh_user'],
                                                            self.prefs['ssh_server'],
                                                            pdf)
@@ -1252,7 +1232,7 @@ class ArXivParser(object):
                                     if len(a['name'].strip()) > 1]).encode('utf-8')
         self.Title = info['title'].encode('utf-8')
         self.Abstract = info['summary'].encode('utf-8')
-        self.AdsComment = info['comment'].replace('"',"'").encode('utf-8') if 'comment' in info else ""
+        self.AdsComment = info['comment'].replace('"',"'").encode('utf-8')
         self.Jornal = 'ArXiv e-prints'
         self.ArchivePrefix = 'arXiv'
         self.ArXivURL = info['id']
@@ -1272,6 +1252,16 @@ class ArXivParser(object):
                '}'
 
 
+def test_mnras():
+    prefs = Preferences()
+    prefs['debug'] = True
+    data = '<iframe id="pdfDocument" src="http://onlinelibrary.wiley.com/store/10.1111/j.1365-2966.2010.18174.x/asset/j.1365-2966.2010.18174.x.pdf?v=1&amp;t=gp75eg4q&amp;s=c7ec3f26d269f5f4187799ff6faf44ebe01bbb01" width="100%" height="100%"></iframe>'
+    parser = MNRASParser(prefs)
+    # parser.parse(mnrasURL)
+    parser.feed(data)
+    print parser.pdfURL
+
+
 class MNRASException(Exception):
     pass
 
@@ -1289,21 +1279,9 @@ class MNRASParser(HTMLParser):
         self.pdfURL = None
 
     def parse(self, url):
-        """Parse URL to MNRAS PDF from MNRAS article page.
-        """
+        """Parse URL to MNRAS PDF page"""
         try:
-            # Detect and decode page's charset
-            logging.debug("Parsing MNRAS url %s" % url)
-            connection = urllib2.urlopen(url)
-            encoding = connection.headers.getparam('charset')
-            if encoding is not None:
-                logging.debug("Detected MNRAS encoding %s" % encoding)
-                page = connection.read().decode(encoding)
-                self.feed(page)
-            else:
-                logging.debug("No detected MNRAS encoding")
-                page = connection.read()
-                self.feed(page)
+            self.feed(urllib2.urlopen(url).read())
         except urllib2.URLError, err:  # HTTP timeout
             logging.debug("MNRASParser timed out: %s", url)
             raise MNRASException(err)
@@ -1311,13 +1289,15 @@ class MNRASParser(HTMLParser):
             raise MNRASException(err)
 
     def handle_starttag(self, tag, attrs):
-        """Called against each HTML tag, looks for metadata indicating
-        the PDF URL.
         """
-        if tag.lower() == "meta":
-            attrs = dict(attrs)
-            if u'name' in attrs and attrs[u'name'] == u'citation_pdf_url':
-                self.pdfURL = attrs[u'content']
+        def get_mnras_pdf(url):
+           soup = BeautifulSoup(urllib2.urlopen(url))
+           pdfurl = soup.find('iframe')['src']
+           open('mnras.pdf', 'wb').write(urllib2.urlopen(pdfurl).read())
+        """
+        if tag.lower() == "iframe":
+            attrDict = dict(attrs)
+            self.pdfURL = attrDict['src']
 
 
 if __name__ == '__main__':
